@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+import json
+import os
+import socket
+import subprocess
+import time
+from typing import *
+
+import typedload
+import xtermcolor  # type: ignore
+
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+user_actions_last: Dict[str, float] = {}
+
+
+class RpcResponse(NamedTuple):
+    id: int
+    result: Any = None
+    error: Any = None
+
+
+class RpcRequest(NamedTuple):
+    id: int
+    method: str
+    params: Any
+    jsonrpc: Literal['2.0'] = '2.0'
+
+
+class RpcBoh(NamedTuple):
+    method: str
+    params: Any
+    jsonrpc: Literal['2.0'] = '2.0'
+
+
+class UserAction(NamedTuple):
+    type: str
+    id: str
+
+
+class Site(NamedTuple):
+    shortName: str
+    name: str
+    connected: bool
+
+    @property
+    def display_name(self) -> str:
+        if self.shortName:
+            return self.shortName
+        return self.name[:4]
+
+
+class ViewData(NamedTuple):
+    sites: List[Site] = []
+    userActions: List[UserAction] = []
+
+
+class Model(NamedTuple):
+    viewData: ViewData = ViewData()
+
+
+def otp() -> str:
+    seed = os.environ['OTP_SEED']
+    return subprocess.check_output(['oathtool', '--totp', '-b', seed]).strip().decode()
+
+
+def call(method: str, params: Any=None, **kwargs) -> None:
+    if params is None:
+        params = kwargs
+    call_id = int(time.time() * 100000)
+    data = json.dumps(typedload.dump(RpcRequest(call_id, method, params), hidedefault=False)).encode() + b'\n'
+    #print('>>>', xtermcolor.colorize(method, 0x00FFFF), data)
+    print(xtermcolor.colorize(method, 0x00FFFF))
+    sock.sendall(data)
+
+    while True:
+        buf = readmsg()
+
+        #print('<<<', buf[:100])
+        try:
+            response = typedload.load(json.loads(buf), RpcResponse)
+        except:
+            continue
+        if response.error:
+            print(xtermcolor.colorize(f'Error {buf!r}', 0xFF0000))
+            raise Exception(response)
+        else:
+            print(xtermcolor.colorize('Ok', 0x00FF00))
+        if response.id != call_id:
+            raise Exception('Unexpected id')
+        else:
+            return
+
+
+def readmsg() -> bytes:
+    '''
+    Extremely inefficient non buffered function to read 1 message from the socket
+    '''
+    data = b''
+    while not data.endswith(b'\r\n'):
+        recv = sock.recv(1)
+        data += recv
+        if len(recv) == 0:
+            raise Exception('Socket was closed')
+    return data
+
+
+def ui() -> None:
+    data = readmsg()
+    request = typedload.load(json.loads(data), RpcBoh)
+
+    if request.method != 'setModel':
+        print ('WARNING: Unknown method', request)
+
+    params = typedload.load(request.params, Model)
+    for site in params.viewData.sites:
+        colour = 0x00FF00 if site.connected else 0xFF0000
+        print(xtermcolor.colorize(site.display_name, colour), end='\t', flush=True)
+    else:
+        print(end='\r')
+
+    # Respond to user actions
+    for i in params.viewData.userActions:
+        # Do not do the same user action before 30 seconds, or the client breaks
+        # despite asking for it again
+
+        if time.time() - user_actions_last.get(i.type, 0) < 30:
+            continue
+        user_actions_last[i.type] = time.time()
+
+        if i.type == 'mfaCode':
+            call('respondMfaCode', pin=otp(), id=i.id)
+        elif i.type == 'messageOfTheDay':
+            call('respondMotd', id=i.id)
+        elif i.type == 'reason':
+            call('respondReason', id=i.id, reason='…')
+        elif i.type == 'renewSaml':
+            call('respondRenewSaml', id=i.id)
+        else:
+            print(xtermcolor.colorize('Unhandled action: ', 0x00FFFF), i)
+        #FIXME: otp, password, motd, saml, expiration, cert, fido2, push, , renewCred, renewCert, update, oneOfReason, oneOfMfa, oneOfPass
+
+
+def start_service() -> None:
+    SERVICE = '/opt/appgate/service/appgateservice'
+    SOCKET = f'/run/user/{os.getuid()}/appgate.service.sock'
+
+    # Clean up stuff
+    print('Starting service...', end='', flush=True)
+    if os.path.exists(SOCKET):
+        os.unlink(SOCKET)
+
+    service_proc = subprocess.Popen(
+        [
+            'firejail',
+            '--profile=/etc/firejail/appgate.profile',
+            SERVICE,
+            #'--loglevel=info',
+        ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+    )
+
+    while not os.path.exists(SOCKET):
+        print('.',end='',flush=True)
+        time.sleep(0.2)
+    print('Service ready')
+    sock.connect(SOCKET)
+
+
+def main():
+    start_service()
+
+    call('ready', autoLogin=True)
+    call('setLocale', locale='it')
+
+    # Wait for the browser to login
+    while True:
+        try:
+            call('loginMfaCode', pin=otp())
+            break
+        except:
+            time.sleep(2)
+
+    while True:
+        ui()
+
+
+if __name__ == '__main__':
+    main()
